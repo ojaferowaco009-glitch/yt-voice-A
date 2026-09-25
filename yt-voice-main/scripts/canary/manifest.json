@@ -1,0 +1,9 @@
+{
+  "job_id": "canary",
+  "channel_id": "canary",
+  "total_shards": 1,
+  "reference_text": "",
+  "shards": [
+    {"index": 0, "text": "This is a short canary test sentence, used only to confirm the voice pipeline still works end to end."}
+  ]
+}
