@@ -1,0 +1,151 @@
+name: Generate Voice
+
+# Triggered by yt-core's voice_clone_client.py via a repository_dispatch
+# call (event_type: voice_job). Multiple channels' pipeline runs can fire
+# this at overlapping times -- see README.md "Concurrency" for why that's
+# safe without any custom scheduler.
+on:
+  repository_dispatch:
+    types: [voice_job]
+  workflow_dispatch:
+    inputs:
+      channel_id:
+        description: 'Channel key (must already have a profile at data/voice_profiles/<channel_id>/)'
+        required: true
+      script_text:
+        description: 'Text to synthesize'
+        required: true
+        default: 'Hello, my name is Maria. I am happy to be here today. I hope you are doing well.'
+      job_id:
+        description: 'Optional job id (blank = auto test-<timestamp>)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      job_id: ${{ steps.plan.outputs.job_id }}
+      channel_id: ${{ steps.plan.outputs.channel_id }}
+      dispatched_at: ${{ steps.plan.outputs.dispatched_at }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Plan shards + fetch reference profile
+        id: plan
+        working-directory: scripts
+        env:
+          YT_CORE_REPO: ${{ vars.YT_CORE_REPO }}
+          YT_CORE_READONLY_PAT: ${{ secrets.YT_CORE_READONLY_PAT }}
+          # Tunable without touching code -- set these under Settings ->
+          # Secrets and variables -> Actions -> Variables. Shard count is
+          # now always maximized within two bounds (see plan_and_fetch.py):
+          # never below MIN_SECONDS_PER_SHARD of content per shard (avoids
+          # choppy single-word fragments), never above MAX_SHARDS_PER_JOB
+          # of the pool (except when F5-TTS's own 30s-per-call limit
+          # forces more, which always takes priority).
+          MIN_SECONDS_PER_SHARD: ${{ vars.MIN_SECONDS_PER_SHARD || '6' }}
+          MAX_SHARDS_PER_JOB: ${{ vars.MAX_SHARDS_PER_JOB || '20' }}
+        run: python plan_and_fetch.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: job-${{ steps.plan.outputs.job_id }}-profile
+          path: scripts/profile/
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: job-${{ steps.plan.outputs.job_id }}-manifest
+          path: scripts/manifest.json
+          retention-days: 1
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # This is the piece that gives you the "one finishes, the next
+      # starts" behavior you asked about -- see README.md "Concurrency".
+      # No custom queue needed: GitHub's own scheduler queues matrix jobs
+      # (here AND across separate workflow runs from other channels) past
+      # the account's concurrency ceiling, and starts each one the moment
+      # a slot frees, first-requested-first-served.
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Cache HuggingFace models (F5-TTS + Vocos, ~1.5GB)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ hashFiles('requirements.txt') }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: job-${{ needs.plan.outputs.job_id }}-profile
+          path: profile/
+      - uses: actions/download-artifact@v4
+        with:
+          name: job-${{ needs.plan.outputs.job_id }}-manifest
+          path: .
+      - name: Synthesize shard ${{ matrix.shard }}
+        run: >
+          python scripts/run_shard.py
+          --manifest manifest.json
+          --shard-index ${{ matrix.shard }}
+          --profile-dir profile
+          --out-dir shard_out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: job-${{ needs.plan.outputs.job_id }}-shard-${{ matrix.shard }}
+          path: shard_out/
+          retention-days: 1
+
+  collect:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          name: job-${{ needs.plan.outputs.job_id }}-manifest
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: job-${{ needs.plan.outputs.job_id }}-shard-*
+          path: shards/
+      - name: Stitch + report status
+        run: |
+          git config user.name "yt-voice-bot"
+          git config user.email "bot@users.noreply.github.com"
+          python scripts/collect_and_stitch.py \
+            --manifest manifest.json \
+            --shards-root shards \
+            --job-id "${{ needs.plan.outputs.job_id }}" \
+            --channel-id "${{ needs.plan.outputs.channel_id }}" \
+            --out-dir "results/${{ needs.plan.outputs.job_id }}" \
+            --started-at "${{ needs.plan.outputs.dispatched_at }}"
+      - name: Notify
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/notify.py "yt-voice job ${{ needs.plan.outputs.job_id }} (channel ${{ needs.plan.outputs.channel_id }}): collect step finished, check results/ for status" || true

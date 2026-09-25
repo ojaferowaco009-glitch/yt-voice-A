@@ -1,0 +1,15 @@
+requests
+
+# F5-TTS -- pinned to a commit/tag once you've confirmed it works for you,
+# rather than left floating on the default branch (see README "Upgrading").
+# `pip install git+...` (rather than PyPI) matches the install method in
+# F5-TTS's own README.
+f5-tts @ git+https://github.com/SWivid/F5-TTS.git
+
+# CPU build by default (see README "GPU vs CPU") -- GitHub-hosted Actions
+# runners on a public repo have no GPU, so there is no CUDA wheel to
+# install here. If you later attach a self-hosted GPU runner, swap these
+# two lines for the matching +cuXXX wheels from
+# https://pytorch.org/get-started/locally/
+torch
+torchaudio
